@@ -898,6 +898,7 @@ async function load(){
     const C = [['queued_flac','FLAC','ok'],['queued_alac','ALAC','ok'],
       ['queued_lossy','Lossy fallback','warn'],['exists','Already had','' ],
       ['pending','Pending',''],['no_source','No source',''],['no_meta','No metadata',''],
+      ['incomplete','Incomplete album','warn'],
       ['low_quality_only','Too low quality','warn'],['error','Errors','bad']];
     $('#counts').innerHTML = C.map(([k,lbl,cls]) => `<tr><td>${lbl}</td>
       <td style="text-align:right"><span class="pill ${(s[k]&&cls)||''}">${(s[k]??0).toLocaleString()}</span></td></tr>`).join('');

@@ -435,7 +435,12 @@ For each album/track, best available wins:
 | 1 | **FLAC** | lossless |
 | 2 | **ALAC** (`.m4a` ≥ `ALAC_MIN_KBPS`, default 500) | also lossless — ranked above *any* lossy source, even a higher-scoring one |
 | 3 | **High-quality lossy** (`mp3`/`aac`/`.m4a`-as-AAC) at `quality_score ≥ 0.55` (~320 kbps / V0) | 320 and V0 preferred |
-| — | skipped | `low_quality_only` (only sub-threshold lossy) or `no_source` |
+| — | skipped | `incomplete` (no source has at least the metadata track count), `low_quality_only` (only sub-threshold lossy), or `no_source` |
+
+Before queueing an album, the librarian gets its MusicBrainz tracklist and only accepts a
+source/format with at least as many matching files as the tracklist contains. Partial
+groups are skipped and counted as **Incomplete album** rather than being downloaded as
+if complete. Single-track candidates are not subjected to this album check.
 
 **The `.m4a` trap:** `.m4a` is a *container* used by both ALAC (lossless) and AAC
 (lossy), and the backend only reports the file **extension**, not the codec — so

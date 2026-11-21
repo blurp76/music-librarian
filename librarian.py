@@ -227,7 +227,7 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS candidates (
             key TEXT PRIMARY KEY,       -- normalized 'artist|album' or 'artist|track'
             artist TEXT, album TEXT, kind TEXT,
-            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|no_source|low_quality_only|no_meta|error|exists
+            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|incomplete|no_source|low_quality_only|no_meta|error|exists
             fmt TEXT,                   -- actual format chosen: flac|alac|mp3|m4a|aac
             kbps INTEGER,               -- measured bitrate of what was queued
             updated_at INTEGER DEFAULT 0
@@ -609,6 +609,9 @@ class Soulbeet:
                        {"input": {"query": query, "artist": artist, "provider": None}})
         return [x for x in d.get("results", []) if x.get("kind") == "Track"]
 
+    def album(self, album_id):
+        return self._post("/api/metadata/album", {"input": {"id": album_id}})
+
     def start_search(self, album, tracks):
         return self._post("/api/download/search/start",
                           {"data": {"album": album, "tracks": tracks, "backend": None}})
@@ -648,13 +651,13 @@ def group_kbps(g):
     return sum(vals) / len(vals) if vals else 0.0
 
 
-def pick_by_quality_ladder(groups):
+def pick_by_quality_ladder(groups, expected_track_count=None):
     """Return (status, items, info). Quality ladder, best first:
 
       1. FLAC                       -> lossless
       2. ALAC (.m4a at >= ALAC_MIN_KBPS) -> also lossless, so ranked with FLAC
       3. high-quality lossy (mp3/aac/.m4a-aac) at >= LOSSY_MIN_SCORE
-      else: low_quality_only / no_source
+      else: incomplete / low_quality_only / no_source
 
     'info' carries the chosen format + measured bitrate so callers can log and
     record exactly what a fallback landed on.
@@ -662,23 +665,33 @@ def pick_by_quality_ladder(groups):
     if not groups:
         return "no_source", [], None
 
+    incomplete = False
+
     # --- tier 1: FLAC ---
     flac = [g for g in groups if g.get("quality") == "flac"]
     if flac:
         flac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
-        items = [it for it in flac[0].get("items", []) if it.get("quality") == "flac"]
-        if items:
-            return "queued_flac", items, {"fmt": "flac", "kbps": round(group_kbps(flac[0]))}
+        for g in flac:
+            items = [it for it in g.get("items", []) if it.get("quality") == "flac"]
+            if items and expected_track_count is not None and len(items) < expected_track_count:
+                incomplete = True
+                continue
+            if items:
+                return "queued_flac", items, {"fmt": "flac", "kbps": round(group_kbps(g))}
 
     # --- tier 2: ALAC (.m4a at lossless bitrate) -- lossless, so preferred over any lossy ---
     alac = [g for g in groups
             if g.get("quality") == "m4a" and group_kbps(g) >= ALAC_MIN_KBPS]
     if alac:
         alac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
-        items = [it for it in alac[0].get("items", [])
-                 if it.get("quality") == "m4a" and est_kbps(it) >= ALAC_MIN_KBPS]
-        if items:
-            return "queued_alac", items, {"fmt": "alac", "kbps": round(group_kbps(alac[0]))}
+        for g in alac:
+            items = [it for it in g.get("items", [])
+                     if it.get("quality") == "m4a" and est_kbps(it) >= ALAC_MIN_KBPS]
+            if items and expected_track_count is not None and len(items) < expected_track_count:
+                incomplete = True
+                continue
+            if items:
+                return "queued_alac", items, {"fmt": "alac", "kbps": round(group_kbps(g))}
 
     # --- tier 3: high-quality lossy ---
     lossy = [g for g in groups if g.get("quality") in LOSSY_EXTS]
@@ -692,10 +705,17 @@ def pick_by_quality_ladder(groups):
             items.sort(key=lambda it: (
                 1 if re.search(r"320|v0", (it.get("title", "") or "").lower()) else 0,
                 it.get("quality_score", 0)), reverse=True)
+            if items and expected_track_count is not None and len(items) < expected_track_count:
+                incomplete = True
+                continue
             if items:
                 return "queued_lossy", items, {"fmt": g.get("quality"),
                                                "kbps": round(group_kbps(g))}
-        return "low_quality_only", [], None
+        if not incomplete:
+            return "low_quality_only", [], None
+
+    if incomplete:
+        return "incomplete", [], None
 
     return "low_quality_only", [], None
 
@@ -1462,9 +1482,17 @@ def process_candidate(state, sb, secrets, row):
             return "exists"
 
         album_obj, tracks = None, []
+        expected_track_count = None
         results = sb.search_album(artist, album or artist)
         if results:
             album_obj = results[0]
+            album_data = sb.album(album_obj["id"])
+            tracks = album_data.get("tracks", [])
+            if not tracks:
+                log(f"  SKIPPED [{artist} - {album}]: metadata has no tracklist to verify")
+                state.set_status(key, "no_meta")
+                return "no_meta"
+            expected_track_count = len(tracks)
         else:
             tr = sb.search_track(artist, album or artist)
             if not tr:
@@ -1474,7 +1502,8 @@ def process_candidate(state, sb, secrets, row):
 
         sid = sb.start_search(album_obj, tracks)
         res = sb.poll(sid)
-        status, items, info = pick_by_quality_ladder(res.get("groups", []))
+        status, items, info = pick_by_quality_ladder(
+            res.get("groups", []), expected_track_count=expected_track_count)
         if items:
             sb.queue(items)
 
@@ -1487,6 +1516,9 @@ def process_candidate(state, sb, secrets, row):
                 f"{info['fmt']} @ ~{info['kbps']} kbps (lossy)")
         elif status == "low_quality_only":
             log(f"  SKIPPED [{artist} - {album}]: only sub-threshold lossy sources")
+        elif status == "incomplete":
+            log(f"  SKIPPED [{artist} - {album}]: no source has at least "
+                f"{expected_track_count} matching files")
 
         state.set_status(key, status,
                          fmt=(info or {}).get("fmt"), kbps=(info or {}).get("kbps"))
@@ -1603,6 +1635,7 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         "queued_lossy": counts.get("queued_lossy", 0),
         # skipped / other
         "no_source": counts.get("no_source", 0),
+        "incomplete": counts.get("incomplete", 0),
         "low_quality_only": counts.get("low_quality_only", 0),
         "no_meta": counts.get("no_meta", 0),
         "exists": counts.get("exists", 0),
